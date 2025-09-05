@@ -7,13 +7,15 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.enums import ParseMode, ChatType
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile
 )
+from aiogram.exceptions import TelegramBadRequest
 
-# Local core helpers
+# Local core helpers (local server = this VPS)
 from wg_core import (
     ensure_root, ensure_paths, state_get, state_set,
     get_owner_id, set_owner_id,
@@ -22,6 +24,11 @@ from wg_core import (
     get_peer_conf_path, make_qr_png,
     wg_restart, wg_stats_preformatted
 )
+
+# ---------- CONFIG ----------
+# Label shown in the menu for the current server (you asked for Dubai)
+CURRENT_SERVER_LABEL = "🇦🇪 Dubai (this VPS)"
+# ----------------------------
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -34,8 +41,11 @@ ensure_paths()
 
 router = Router(name="wgbot")
 
+# --------- helpers: UI + cleanup ---------
 def main_menu(owner_set: bool) -> InlineKeyboardMarkup:
     rows = []
+    # top banner with server/country picker (local for now)
+    rows.append([InlineKeyboardButton(text=f"🌍 {CURRENT_SERVER_LABEL}", callback_data="server:current")])
     if not owner_set:
         rows.append([InlineKeyboardButton(text="🔐 I’m the owner (set me)", callback_data="owner:claim")])
     else:
@@ -52,71 +62,15 @@ def main_menu(owner_set: bool) -> InlineKeyboardMarkup:
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-@router.message(CommandStart())
-async def start(m: Message):
-    await m.answer(
-        "👋 <b>WireGuard VPN Manager</b>\n"
-        "Everything works via buttons.\n\n"
-        "First, set yourself as the owner.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu(owner_set=(get_owner_id() is not None))
-    )
+async def safe_delete(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramBadRequest:
+        # already deleted or too old — ignore
+        pass
+    except Exception:
+        pass
 
-def only_owner(user_id: int) -> bool:
-    owner = get_owner_id()
-    return owner is not None and owner == user_id
-
-async def deny(cq: CallbackQuery):
-    await cq.answer("Access denied", show_alert=True)
-
-# ---------- Owner claim ----------
-@router.callback_query(F.data == "owner:claim")
-async def cb_owner_claim(cq: CallbackQuery):
-    if get_owner_id() is None:
-        set_owner_id(cq.from_user.id, cq.from_user.username or "")
-        await cq.message.edit_text(
-            f"✅ Owner set: <b>{cq.from_user.id}</b>\nNow you can manage the VPN.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(owner_set=True)
-        )
-        await cq.answer("Owner saved")
-    else:
-        if not only_owner(cq.from_user.id):
-            return await deny(cq)
-        await cq.answer("Owner already set")
-
-# ---------- WG install / check ----------
-@router.callback_query(F.data == "wg:install")
-async def cb_wg_install(cq: CallbackQuery):
-    if not only_owner(cq.from_user.id): return await deny(cq)
-    ok, msg = install_wireguard_quick()
-    await cq.message.answer(("✅ " if ok else "❌ ") + msg, parse_mode=ParseMode.HTML)
-    await cq.answer()
-
-# ---------- WG restart ----------
-@router.callback_query(F.data == "wg:restart")
-async def cb_wg_restart(cq: CallbackQuery):
-    if not only_owner(cq.from_user.id): return await deny(cq)
-    ok, msg = wg_restart()
-    await cq.message.answer(("✅ " if ok else "❌ ") + msg)
-    await cq.answer()
-
-# ---------- WG stats ----------
-@router.callback_query(F.data == "wg:stats")
-async def cb_wg_stats(cq: CallbackQuery):
-    if not only_owner(cq.from_user.id): return await deny(cq)
-    text = wg_stats_preformatted()
-    await cq.message.answer(text, parse_mode=ParseMode.HTML)
-    await cq.answer()
-
-# ---------- Peers: list ----------
-@router.callback_query(F.data == "peer:list")
-async def cb_peer_list(cq: CallbackQuery):
-    if not only_owner(cq.from_user.id): return await deny(cq)
-    await cq.message.answer(list_peers_text(), parse_mode=ParseMode.HTML)
-    await cq.answer()
-
-# Simple step memory in state file
 def set_step(user_id: int, step: str, extra: dict | None = None):
     db = state_get()
     db.setdefault("steps", {})
@@ -133,41 +87,140 @@ def clear_step(user_id: int):
         db["steps"].pop(str(user_id), None)
         state_set(db)
 
-# ---------- Peers: add (button -> ask name) ----------
+def set_prompt_message_id(user_id: int, msg_id: int):
+    db = state_get()
+    db.setdefault("prompts", {})
+    db["prompts"][str(user_id)] = msg_id
+    state_set(db)
+
+def pop_prompt_message_id(user_id: int):
+    db = state_get()
+    pid = db.get("prompts", {}).pop(str(user_id), None)
+    state_set(db)
+    return pid
+
+def only_owner(user_id: int) -> bool:
+    owner = get_owner_id()
+    return owner is not None and owner == user_id
+
+async def deny(cq: CallbackQuery):
+    await cq.answer("Access denied", show_alert=True)
+
+# --------- handlers ---------
+@router.message(CommandStart())
+async def start(m: Message):
+    await m.answer(
+        "👋 <b>WireGuard VPN Manager</b>\n"
+        "Buttons only. First, set yourself as the owner.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(owner_set=(get_owner_id() is not None))
+    )
+
+# Owner claim
+@router.callback_query(F.data == "owner:claim")
+async def cb_owner_claim(cq: CallbackQuery):
+    if get_owner_id() is None:
+        set_owner_id(cq.from_user.id, cq.from_user.username or "")
+        # edit in place (cleaner UI)
+        await cq.message.edit_text(
+            f"✅ Owner set: <b>{cq.from_user.id}</b>\nNow you can manage the VPN.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(owner_set=True)
+        )
+        await cq.answer("Owner saved")
+    else:
+        if not only_owner(cq.from_user.id):
+            return await deny(cq)
+        await cq.answer("Owner already set")
+
+# Server banner (currently informational)
+@router.callback_query(F.data == "server:current")
+async def cb_server_banner(cq: CallbackQuery):
+    if not only_owner(cq.from_user.id): return await deny(cq)
+    await cq.answer(CURRENT_SERVER_LABEL, show_alert=True)
+
+# Install / Check
+@router.callback_query(F.data == "wg:install")
+async def cb_wg_install(cq: CallbackQuery):
+    if not only_owner(cq.from_user.id): return await deny(cq)
+    ok, msg = install_wireguard_quick()
+    out = ("✅ " if ok else "❌ ") + msg
+    # send fresh message and delete the button message to keep chat tidy
+    sent = await cq.message.answer(out, parse_mode=ParseMode.HTML, reply_markup=main_menu(owner_set=True))
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await cq.answer()
+
+# Restart WG
+@router.callback_query(F.data == "wg:restart")
+async def cb_wg_restart(cq: CallbackQuery):
+    if not only_owner(cq.from_user.id): return await deny(cq)
+    ok, msg = wg_restart()
+    await cq.message.answer(("✅ " if ok else "❌ ") + msg)
+    await cq.answer()
+
+# Stats
+@router.callback_query(F.data == "wg:stats")
+async def cb_wg_stats(cq: CallbackQuery):
+    if not only_owner(cq.from_user.id): return await deny(cq)
+    await cq.message.answer(wg_stats_preformatted(), parse_mode=ParseMode.HTML)
+    await cq.answer()
+
+# List peers
+@router.callback_query(F.data == "peer:list")
+async def cb_peer_list(cq: CallbackQuery):
+    if not only_owner(cq.from_user.id): return await deny(cq)
+    await cq.message.answer(list_peers_text(), parse_mode=ParseMode.HTML)
+    await cq.answer()
+
+# Ask name helpers (store prompt id so we can delete it later)
+async def ask_and_track_prompt(cq: CallbackQuery, text_html: str):
+    msg = await cq.message.answer(text_html, parse_mode=ParseMode.HTML)
+    set_step(cq.from_user.id, text_html)  # store step label temporarily (overwritten below)
+    set_prompt_message_id(cq.from_user.id, msg.message_id)
+    return msg
+
+# Add peer (ask name)
 @router.callback_query(F.data == "peer:add")
 async def cb_peer_add(cq: CallbackQuery):
     if not only_owner(cq.from_user.id): return await deny(cq)
     if not is_wireguard_ready():
         return await cq.message.answer("⚠️ WireGuard not ready. Tap “🧰 Install/Check WireGuard” first.")
     set_step(cq.from_user.id, "await_name_add")
-    await cq.message.answer("✍️ Send a name for the new peer (e.g., <code>iphone13</code>)", parse_mode=ParseMode.HTML)
+    msg = await cq.message.answer("✍️ Send a name for the new peer (e.g., <code>iphone13</code>)", parse_mode=ParseMode.HTML)
+    set_prompt_message_id(cq.from_user.id, msg.message_id)
     await cq.answer()
 
-# ---------- Peers: get config (button -> ask name) ----------
+# Get config (ask name)
 @router.callback_query(F.data == "peer:cfg")
 async def cb_peer_cfg(cq: CallbackQuery):
     if not only_owner(cq.from_user.id): return await deny(cq)
     set_step(cq.from_user.id, "await_name_cfg")
-    await cq.message.answer("📦 Send peer name to get the <b>.conf</b> file", parse_mode=ParseMode.HTML)
+    msg = await cq.message.answer("📦 Send peer name to get the <b>.conf</b> file", parse_mode=ParseMode.HTML)
+    set_prompt_message_id(cq.from_user.id, msg.message_id)
     await cq.answer()
 
-# ---------- Peers: QR (button -> ask name) ----------
+# QR (ask name)
 @router.callback_query(F.data == "peer:qr")
 async def cb_peer_qr(cq: CallbackQuery):
     if not only_owner(cq.from_user.id): return await deny(cq)
     set_step(cq.from_user.id, "await_name_qr")
-    await cq.message.answer("🔳 Send peer name to get the <b>QR code</b>", parse_mode=ParseMode.HTML)
+    msg = await cq.message.answer("🔳 Send peer name to get the <b>QR code</b>", parse_mode=ParseMode.HTML)
+    set_prompt_message_id(cq.from_user.id, msg.message_id)
     await cq.answer()
 
-# ---------- Peers: revoke (button -> ask name) ----------
+# Revoke (ask name)
 @router.callback_query(F.data == "peer:revoke")
 async def cb_peer_revoke(cq: CallbackQuery):
     if not only_owner(cq.from_user.id): return await deny(cq)
     set_step(cq.from_user.id, "await_name_revoke")
-    await cq.message.answer("🗑 Send peer name to revoke", parse_mode=ParseMode.HTML)
+    msg = await cq.message.answer("🗑 Send peer name to revoke", parse_mode=ParseMode.HTML)
+    set_prompt_message_id(cq.from_user.id, msg.message_id)
     await cq.answer()
 
-# ---------- Help ----------
+# Help
 @router.callback_query(F.data == "help")
 async def cb_help(cq: CallbackQuery):
     if not only_owner(cq.from_user.id): return await deny(cq)
@@ -177,16 +230,17 @@ async def cb_help(cq: CallbackQuery):
         "• ➕ <b>Add peer</b> — create a new client (you’ll be asked for a name)\n"
         "• 📋 <b>List peers</b> — see all clients and their IPs\n"
         "• 🧾 <b>Get config</b> — sends a .conf file to import on desktop/mobile\n"
-        "• 🔳 <b>QR code</b> — scan with the WireGuard app (iPhone 13 friendly)\n"
+        "• 🔳 <b>QR code</b> — scan with the WireGuard app (iPhone-friendly)\n"
         "• 🗑 <b>Revoke peer</b> — remove a client’s access\n"
         "• ♻️ <b>Restart WG</b> — restart interface if endpoint/DNS changed\n"
         "• 📈 <b>Stats</b> — show handshakes & data usage\n\n"
-        "Tip: Add your iPhone with a simple name like <code>iphone13</code> then tap 🔳 to scan.\n"
+        "<b>iPhone setup</b> → Install WireGuard app → Add → <i>Create from QR code</i> → scan the QR from the bot → Activate ✅\n"
+        "(Do NOT use iOS IKEv2 screen; ours is WireGuard.)"
     )
     await cq.message.answer(msg, parse_mode=ParseMode.HTML)
     await cq.answer()
 
-# ---------- Text handler for the step prompts ----------
+# ---------- Text handler (step engine + auto-delete) ----------
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def private_text(m: Message):
     owner_id = get_owner_id()
@@ -204,29 +258,37 @@ async def private_text(m: Message):
     if not name:
         return await m.answer("Send a valid name.")
 
+    # Remember prompt id to delete after we answer
+    prompt_id = pop_prompt_message_id(m.from_user.id)
+
     if step == "await_name_add":
         try:
-            created_name, ip, _conf_path = add_peer(name)
-            await m.answer(
+            created_name, ip, _cpath = add_peer(name)
+            out = (
                 f"✅ Added <b>{created_name}</b> with IP <code>{ip}</code>\n"
-                f"Use <b>🔳 QR code</b> or <b>🧾 Get config</b>.",
-                parse_mode=ParseMode.HTML
+                f"Use <b>🔳 QR code</b> or <b>🧾 Get config</b>."
             )
+            await m.answer(out, parse_mode=ParseMode.HTML)
         except Exception as e:
             await m.answer(f"❌ {e}")
         finally:
+            # delete the user message + the prompt message to keep chat clean
+            await safe_delete(m.bot, m.chat.id, m.message_id)
+            if prompt_id: await safe_delete(m.bot, m.chat.id, prompt_id)
             clear_step(m.from_user.id)
 
     elif step == "await_name_cfg":
         cpath = get_peer_conf_path(name)
         if not cpath:
-            await m.answer("❌ No such peer.")
+            msg = await m.answer("❌ No such peer.")
         else:
             data = cpath.read_bytes()
-            await m.answer_document(
+            msg = await m.answer_document(
                 BufferedInputFile(data, filename=f"{name}.conf"),
                 caption=f"Config for <b>{name}</b>", parse_mode=ParseMode.HTML
             )
+        await safe_delete(m.bot, m.chat.id, m.message_id)
+        if prompt_id: await safe_delete(m.bot, m.chat.id, prompt_id)
         clear_step(m.from_user.id)
 
     elif step == "await_name_qr":
@@ -242,15 +304,20 @@ async def private_text(m: Message):
                 )
             except Exception as e:
                 await m.answer(f"❌ {e}")
+        await safe_delete(m.bot, m.chat.id, m.message_id)
+        if prompt_id: await safe_delete(m.bot, m.chat.id, prompt_id)
         clear_step(m.from_user.id)
 
     elif step == "await_name_revoke":
         ok, msg = revoke_peer(name)
         await m.answer(("✅ " if ok else "❌ ") + msg)
+        await safe_delete(m.bot, m.chat.id, m.message_id)
+        if prompt_id: await safe_delete(m.bot, m.chat.id, prompt_id)
         clear_step(m.from_user.id)
 
+# ---------- runner ----------
 async def main():
-    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
