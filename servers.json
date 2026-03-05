@@ -1,0 +1,36 @@
+{
+ "singapore": {
+  "name": "🇸🇬 Singapore",
+  "ip": "SERVER_IP",
+  "public_key": "SERVER_PUBLIC_KEY",
+  "port": 51820
+ },
+
+ "netherlands": {
+  "name": "🇳🇱 Netherlands",
+  "ip": "SERVER_IP",
+  "public_key": "SERVER_PUBLIC_KEY",
+  "port": 51820
+ },
+
+ "switzerland": {
+  "name": "🇨🇭 Switzerland",
+  "ip": "SERVER_IP",
+  "public_key": "SERVER_PUBLIC_KEY",
+  "port": 51820
+ },
+
+ "korea": {
+  "name": "🇰🇷 South Korea",
+  "ip": "SERVER_IP",
+  "public_key": "SERVER_PUBLIC_KEY",
+  "port": 51820
+ },
+
+ "iceland": {
+  "name": "🇮🇸 Iceland",
+  "ip": "SERVER_IP",
+  "public_key": "SERVER_PUBLIC_KEY",
+  "port": 51820
+ }
+}
