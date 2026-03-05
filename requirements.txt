@@ -1,2 +1,4 @@
-aiogram==3.*
-python-dotenv==1.*
+aiogram
+qrcode
+cryptography
+pynacl
